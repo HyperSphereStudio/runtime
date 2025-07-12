@@ -1667,8 +1667,8 @@ TypeHandle SigPointer::GetTypeHandleThrowing(
                             if (!failedLayoutCompare)
                             {
 #ifndef DACCESS_COMPILE
-                                failedLayoutCompare = CGCDesc::GetNumPointers(thRet.AsMethodTable(), objectSizeCanonInstantiation, 0) !=
-                                                      CGCDesc::GetNumPointers(thFound.AsMethodTable(), objectSizeCanonInstantiation, 0);
+                                failedLayoutCompare = CGCDesc::GetMaxNumPointers(thRet.AsMethodTable(), objectSizeCanonInstantiation, 0) !=
+                                                      CGCDesc::GetMaxNumPointers(thFound.AsMethodTable(), objectSizeCanonInstantiation, 0);
 #else
                                 DacNotImpl();
 #endif

@@ -18,6 +18,16 @@
 
 #include "common.h"
 #include "gcenv.h"
+#include "GraphWalker.hpp"
+
+class CGCDesc;
+struct alignas(size_t) GraphNode {
+    int32_t index;
+    CGCDesc* desc;
+
+    void SetDesc(CGCDesc* desc);
+};
+ObjectPool<FastGraphStack<GraphNode>> FastGraphWalker<GraphNode>::g_graphWalkingPool(5, 5);
 
 #include "gc.h"
 #include "gcscan.h"
@@ -27,6 +37,11 @@
 #include "handletable.inl"
 #include "gcenv.inl"
 #include "gceventstatus.h"
+
+void GraphNode::SetDesc(CGCDesc* desc) {
+     this->desc = desc;
+     this->index = (int32_t) desc->GetNumEntries() - 1;
+}
 
 #ifdef __INTELLISENSE__
 #if defined(FEATURE_SVR_GC)
@@ -27348,67 +27363,82 @@ BOOL gc_heap::background_mark (uint8_t* o, uint8_t* low, uint8_t* high)
 #define ignore_start 0
 #define use_start 1
 
-#define go_through_object(mt,o,size,parm,start,start_useful,limit,exp)      \
-{                                                                           \
-    CGCDesc* map = CGCDesc::GetCGCDescFromMT((MethodTable*)(mt));           \
-    CGCDescSeries* cur = map->GetHighestSeries();                           \
-    ptrdiff_t cnt = (ptrdiff_t) map->GetNumSeries();                        \
-                                                                            \
-    if (cnt >= 0)                                                           \
-    {                                                                       \
-        CGCDescSeries* last = map->GetLowestSeries();                       \
-        uint8_t** parm = 0;                                                 \
-        do                                                                  \
-        {                                                                   \
-            assert (parm <= (uint8_t**)((o) + cur->GetSeriesOffset()));     \
-            parm = (uint8_t**)((o) + cur->GetSeriesOffset());               \
-            uint8_t** ppstop =                                              \
-                (uint8_t**)((uint8_t*)parm + cur->GetSeriesSize() + (size));\
-            if (!start_useful || (uint8_t*)ppstop > (start))                \
-            {                                                               \
-                if (start_useful && (uint8_t*)parm < (start)) parm = (uint8_t**)(start);\
-                while (parm < ppstop)                                       \
-                {                                                           \
-                   {exp}                                                    \
-                   parm++;                                                  \
-                }                                                           \
-            }                                                               \
-            cur--;                                                          \
-                                                                            \
-        } while (cur >= last);                                              \
-    }                                                                       \
-    else                                                                    \
-    {                                                                       \
-        /* Handle the repeating case - array of valuetypes */               \
-        uint8_t** parm = (uint8_t**)((o) + cur->startoffset);               \
-        if (start_useful && start > (uint8_t*)parm)                         \
-        {                                                                   \
-            ptrdiff_t cs = mt->RawGetComponentSize();                         \
-            parm = (uint8_t**)((uint8_t*)parm + (((start) - (uint8_t*)parm)/cs)*cs); \
-        }                                                                   \
-        while ((uint8_t*)parm < ((o)+(size)-plug_skew))                     \
-        {                                                                   \
-            for (ptrdiff_t __i = 0; __i > cnt; __i--)                         \
-            {                                                               \
-                HALF_SIZE_T skip =  (cur->val_serie + __i)->skip;           \
-                HALF_SIZE_T nptrs = (cur->val_serie + __i)->nptrs;          \
-                uint8_t** ppstop = parm + nptrs;                            \
-                if (!start_useful || (uint8_t*)ppstop > (start))            \
-                {                                                           \
-                    if (start_useful && (uint8_t*)parm < (start)) parm = (uint8_t**)(start);      \
-                    do                                                      \
-                    {                                                       \
-                       {exp}                                                \
-                       parm++;                                              \
-                    } while (parm < ppstop);                                \
-                }                                                           \
-                parm = (uint8_t**)((uint8_t*)ppstop + skip);                \
-            }                                                               \
-        }                                                                   \
-    }                                                                       \
-}
+#define go_through_object(mt,o,size,parm,start,start_useful,limit,exp){        \
+    FastGraphWalker<GraphNode> walker;                                         \
+    walker.parent.SetDesc(CGCDesc::GetCGCDescFromMT((MethodTable*)(mt)));      \
+    walker.parentPushed();                                                     \
+    GraphNode* n;                                                              \
+    uint8_t** parm = 0;                                                        \
+    printf("\n\nEnter Object:%p\n", o);                                        \
+                                                                               \
+    while((n = walker.currentNode()) != nullptr){                              \
+         while(n->index > -1){                                                 \
+              auto e = n->desc->GetEntry(n->index);                            \
+              parm = (uint8_t**) ((uint8_t*)o + e->GetOffset());               \
+              printf("Entry[%d]: o:%p %p->%p Offset:%d Union:%d\n", (size_t) n->index, o, parm, *parm, (int32_t) e->GetOffset(), e->IsUnionType()); \
+              n->index--;                                                      \
+              if (e->IsUnionType()) {                                          \
+                  auto ot = walker.parent.desc->GetUnionOffsetTable(e->GetUnionOffsetTableOffset());\
+                  printf("Union Type:%u UnionOffsetTableOffset:%d\n", *(UnionTypeType*) parm, e->GetUnionOffsetTableOffset()); \
+                  auto dof = ot->GetUnionDescOffset(*(UnionTypeType*) parm);   \
+                  printf("\tUnionDescTableOffset:%d\n", dof);                  \
+                  if (dof != CGCUnionDescOffsetNull) {                         \
+                       GraphNode gn;                                           \
+                       gn.SetDesc(walker.parent.desc->GetUnionDesc(dof));      \
+                       walker.pushNode(gn);                                    \
+                       n = walker.currentNode();                               \
+                       continue;                                               \
+                  }                                                            \
+              }                                                                \
+              else {                                                           \
+                 uint8_t** ppstop = parm + e->GetPointerSpanLength();          \
+                 if (!start_useful || (uint8_t*)ppstop > (start)){             \
+                     if (start_useful && (uint8_t*)parm < (start))             \
+                         parm = (uint8_t**)(start);                            \
+                     while (parm < ppstop){                                    \
+                         {exp}                                                 \
+                         parm++;                                               \
+                     }                                                         \
+                 }                                                             \
+              }                                                                \
+         }                                                                     \
+         walker.popNode();                                                     \
+    }                                                                          \
+}                                                                                
 
-#define go_through_object_nostart(mt,o,size,parm,exp) {go_through_object(mt,o,size,parm,o,ignore_start,(o + size),exp); }
+
+
+#define go_through_valuearray(mt,map,o,size,parm,start,start_useful,exp)       \
+     CGCDescSeries* cur = map->GetHighestSeries();                             \
+     /* Handle the repeating case - array of valuetypes */                     \
+     uint8_t** parm = (uint8_t**)((o) + cur->GetSeriesOffset());               \
+     if (start_useful && start > (uint8_t*)parm)                               \
+        {                                                                      \
+            ptrdiff_t cs = mt->RawGetComponentSize();                          \
+            parm = (uint8_t**)((uint8_t*)parm + (((start) - (uint8_t*)parm)/cs)*cs); \
+        }                                                                      \
+        while ((uint8_t*)parm < ((o)+(size)-plug_skew))                        \
+        {                                                                      \
+            for (ptrdiff_t __i = 0; __i > cnt; __i--)                          \
+            {                                                                  \
+                HALF_SIZE_T skip =  (cur->val_serie + __i)->GetSkip();         \
+                HALF_SIZE_T nptrs = (cur->val_serie + __i)->GetNumberOfPointers();\
+                uint8_t** ppstop = parm + nptrs;                               \
+                if (!start_useful || (uint8_t*)ppstop > (start))               \
+                {                                                              \
+                    if (start_useful && (uint8_t*)parm < (start)) parm = (uint8_t**)(start);\
+                    do                                                         \
+                    {                                                          \
+                       {exp}                                                   \
+                       parm++;                                                 \
+                    } while (parm < ppstop);                                   \
+                }                                                              \
+                parm = (uint8_t**)((uint8_t*)ppstop + skip);                   \
+            }                                                                  \
+        }                                                                      \
+
+
+#define go_through_object_nostart(mt,o,size,parm,exp) { go_through_object(mt,o,size,parm,o,ignore_start,(o + size),exp); }
 
 // 1 thing to note about this macro:
 // 1) you can use *parm safely but in general you don't want to use parm
@@ -27416,7 +27446,7 @@ BOOL gc_heap::background_mark (uint8_t* o, uint8_t* low, uint8_t* high)
 #ifndef COLLECTIBLE_CLASS
 #define go_through_object_cl(mt,o,size,parm,exp)                            \
 {                                                                           \
-    if (header(o)->ContainsGCPointers())                                      \
+    if (header(o)->ContainsGCPointers())                                    \
     {                                                                       \
         go_through_object_nostart(mt,o,size,parm,exp);                      \
     }                                                                       \
@@ -27426,11 +27456,11 @@ BOOL gc_heap::background_mark (uint8_t* o, uint8_t* low, uint8_t* high)
 {                                                                           \
     if (header(o)->Collectible())                                           \
     {                                                                       \
-        uint8_t* class_obj = get_class_object (o);                             \
-        uint8_t** parm = &class_obj;                                           \
+        uint8_t* class_obj = get_class_object (o);                          \
+        uint8_t** parm = &class_obj;                                        \
         do {exp} while (false);                                             \
     }                                                                       \
-    if (header(o)->ContainsGCPointers())                                      \
+    if (header(o)->ContainsGCPointers())                                     \
     {                                                                       \
         go_through_object_nostart(mt,o,size,parm,exp);                      \
     }                                                                       \
@@ -27835,7 +27865,7 @@ void gc_heap::mark_object_simple1 (uint8_t* oo, uint8_t* start THREAD_NUMBER_DCL
                 if (mark_stack_tos + (s) /sizeof (uint8_t*) >= (mark_stack_limit  - 1))
                 {
                     size_t num_components = ((method_table(oo))->HasComponentSize() ? ((CObjectHeader*)oo)->GetNumComponents() : 0);
-                    if (mark_stack_tos + CGCDesc::GetNumPointers(method_table(oo), s, num_components) >= (mark_stack_limit - 1))
+                    if (mark_stack_tos + CGCDesc::GetMaxNumPointers(method_table(oo), s, num_components) >= (mark_stack_limit - 1))
                     {
                         overflow_p = TRUE;
                     }
@@ -28508,7 +28538,7 @@ void gc_heap::background_mark_simple1 (uint8_t* oo THREAD_NUMBER_DCL)
                 if (background_mark_stack_tos + (s) /sizeof (uint8_t*) >= (mark_stack_limit - 1))
                 {
                     size_t num_components = ((method_table(oo))->HasComponentSize() ? ((CObjectHeader*)oo)->GetNumComponents() : 0);
-                    size_t num_pointers = CGCDesc::GetNumPointers(method_table(oo), s, num_components);
+                    size_t num_pointers = CGCDesc::GetMaxNumPointers(method_table(oo), s, num_components);
                     if (background_mark_stack_tos + num_pointers >= (mark_stack_limit - 1))
                     {
                         dprintf (2, ("h%d: %zd left, obj (mt: %p) %zd ptrs",
@@ -28599,7 +28629,7 @@ void gc_heap::background_mark_simple1 (uint8_t* oo THREAD_NUMBER_DCL)
                 if (background_mark_stack_tos + (num_partial_refs + 2)  >= mark_stack_limit)
                 {
                     size_t num_components = ((method_table(oo))->HasComponentSize() ? ((CObjectHeader*)oo)->GetNumComponents() : 0);
-                    size_t num_pointers = CGCDesc::GetNumPointers(method_table(oo), s, num_components);
+                    size_t num_pointers = CGCDesc::GetMaxNumPointers(method_table(oo), s, num_components);
 
                     dprintf (2, ("h%d: PM: %zd left, obj %p (mt: %p) start: %p, total: %zd",
                         heap_number,

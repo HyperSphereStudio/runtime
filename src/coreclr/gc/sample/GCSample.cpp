@@ -114,6 +114,164 @@ void WriteBarrier(Object ** dst, Object * ref)
 
 extern "C" HRESULT LOCALGC_CALLCONV GC_Initialize(IGCToCLR* clrToGC, IGCHeap** gcHeap, IGCHandleManager** gcHandleManager, GcDacVars* gcDacVars);
 
+enum Union1Type : UnionTypeType{
+    U1_NULL = 0,
+    U1_C_TYPE = 1,
+
+    U1_MANAGED_CNT = U1_C_TYPE,
+
+    U1_E_TYPE = 2
+};
+
+struct Union1 {
+    union {
+        Object* c;
+        int e;
+    };
+    UnionTypeType type;
+};
+
+class MyU : Object {
+   public:
+
+   Object * a;
+   int d;
+   Object * b;
+   Union1 u1;
+};
+
+MyU* DataPtrFromHandle(OBJECTHANDLE hnd) {
+     return (MyU*) (HndFetchHandle(hnd)+1);
+}
+
+int unionTypeExample(IGCHeap* pGCHeap) {
+    static struct MyUTable_MT{
+        CGCDescEntry m_u1_c_Desc_entries[1];
+        CGCDesc u1DescC;
+
+        CGCUnionDescOffset m_u1DescOffsets[1];
+        CGCUnionOffsetTable m_u1OffsetTable;
+
+        CGCDescEntry m_entries[3];
+        CGCDesc desc;
+
+        // The actual methodtable
+        MethodTable m_MT;
+    }
+    pMT;
+
+    // 'My' contains the MethodTable*
+    uint32_t baseSize = sizeof(MyU);
+    // GC expects the size of ObjHeader (extra void*) to be included in the size.
+    baseSize = baseSize + sizeof(ObjHeader);
+
+    // Add padding as necessary. GC requires the object size to be at least MIN_OBJECT_SIZE.
+    pMT.m_MT.m_baseSize = max(baseSize, (uint32_t)MIN_OBJECT_SIZE);
+    pMT.m_MT.m_componentSize = 0;    // Array component size
+    pMT.m_MT.m_flags = MTFlag_ContainsGCPointers;
+
+    //u1 Desc Table
+    pMT.m_u1_c_Desc_entries[0].SetPointerSpan(1, offsetof(MyU, u1.c));
+    pMT.u1DescC.Init(1, sizeof(CGCDesc) + sizeof(CGCDescEntry)*1, false);
+
+    //u1 Offset Table
+    pMT.m_u1DescOffsets[0] = offsetof(MyUTable_MT, desc) - offsetof(MyUTable_MT, u1DescC);
+    pMT.m_u1OffsetTable.Init(U1_MANAGED_CNT);
+    
+    //MyU Desc Table
+    pMT.m_entries[2].SetUnion(offsetof(MyU, u1.type), offsetof(MyUTable_MT, m_u1OffsetTable));
+    pMT.m_entries[1].SetPointerSpan(1, offsetof(MyU, b));
+    pMT.m_entries[0].SetPointerSpan(1, offsetof(MyU, a));
+    pMT.desc.Init(3, sizeof(pMT) - sizeof(MethodTable*), false);
+
+    Union1Type u1t = U1_E_TYPE;
+
+    printf("My Object Size:%d Offset_a:%u Offset_b:%u offset_c:%u\n", pMT.m_MT.m_baseSize, pMT.desc.GetEntry(2)->GetOffset(), pMT.desc.GetEntry(1)->GetOffset(), pMT.desc.GetEntry(0)->GetOffset());
+    printf("U1->C Desc Offset:%zu\n", pMT.m_u1OffsetTable.GetUnionDescOffset(u1t));
+    printf("U1 Real Offset:%p\n", &pMT.m_u1DescOffsets[0]);
+
+    MethodTable * pMyMethodTable = &pMT.m_MT;
+    
+    // Allocate instance of MyObject
+    Object * pObj = AllocateObject(pMyMethodTable);
+    
+    if (pObj == NULL)
+        return -1;
+
+    Object * p1 = AllocateObject(pMyMethodTable);
+    Object * p2 = AllocateObject(pMyMethodTable);
+    Object * p3 = AllocateObject(pMyMethodTable);
+    
+    // Create strong handle and store the object into it
+    OBJECTHANDLE oh = HndCreateHandle(g_HandleTableMap.pBuckets[0]->pTable[GetCurrentThreadHomeHeapNumber()], HNDTYPE_DEFAULT, pObj);
+
+    if (oh == NULL)
+       return -1;
+
+    WriteBarrier(&DataPtrFromHandle(oh)->a, p1);
+    WriteBarrier(&DataPtrFromHandle(oh)->b, p2);
+    DataPtrFromHandle(oh)->u1.type = u1t; 
+
+    printf("HandlePtr:%p DataPtr:%p\n", HndFetchHandle(oh), DataPtrFromHandle(oh));
+    printf("(o->a) %p=%p (o->b) %p=%p\n", &DataPtrFromHandle(oh)->a, p1, &DataPtrFromHandle(oh)->b, p2);
+        
+    OBJECTHANDLE ohWeak1 = HndCreateHandle(g_HandleTableMap.pBuckets[0]->pTable[GetCurrentThreadHomeHeapNumber()], HNDTYPE_WEAK_DEFAULT, p1);
+    OBJECTHANDLE ohWeak2 = HndCreateHandle(g_HandleTableMap.pBuckets[0]->pTable[GetCurrentThreadHomeHeapNumber()], HNDTYPE_WEAK_DEFAULT, p2);
+    OBJECTHANDLE ohWeak3 = nullptr;
+
+    if(u1t == U1_C_TYPE)
+       ohWeak3 = HndCreateHandle(g_HandleTableMap.pBuckets[0]->pTable[GetCurrentThreadHomeHeapNumber()], HNDTYPE_WEAK_DEFAULT, p3);
+
+    if (ohWeak1 == NULL)
+        return -1;
+
+    if (u1t == U1_C_TYPE) {
+        WriteBarrier(&DataPtrFromHandle(oh)->u1.c, p3);
+        printf("Union (o->u1.c) = %p = %p\n", DataPtrFromHandle(oh)->u1.c, HndFetchHandle(ohWeak3));
+    }   
+    else if (u1t == U1_E_TYPE) {
+        DataPtrFromHandle(oh)->u1.e = 5;
+        printf("Union (o->u1.e) = %d\n", DataPtrFromHandle(oh)->u1.e);
+    }
+
+    printf("\n");
+
+    DataPtrFromHandle(ohWeak1)->d = 3;
+    DataPtrFromHandle(ohWeak2)->d = 5;
+    printf("Pre GC With Handle 1:%p->%d 2:%p->%d\n",
+        HndFetchHandle(ohWeak1), DataPtrFromHandle(ohWeak1)->d,
+        HndFetchHandle(ohWeak2), DataPtrFromHandle(ohWeak2)->d);
+    if(u1t == U1_C_TYPE)
+         printf("Union (o->u1.c) = %p = %p\n", DataPtrFromHandle(oh)->u1.c, HndFetchHandle(ohWeak3));
+    else if(u1t == U1_E_TYPE)
+        printf("Union (o->u1.e) = %d\n", DataPtrFromHandle(oh)->u1.e);
+
+    printf("\n");
+
+    // Explicitly trigger full GC
+    pGCHeap->GarbageCollect();
+
+    printf("Post GC With Handle 1:%p->%d 2:%p->%d\n",
+        HndFetchHandle(ohWeak1), DataPtrFromHandle(ohWeak1)->d,
+        HndFetchHandle(ohWeak2), DataPtrFromHandle(ohWeak2)->d);
+    if(u1t == U1_C_TYPE)
+        printf("Union (o->u1.c) = %p = %p\n", DataPtrFromHandle(oh)->u1.c, HndFetchHandle(ohWeak3));
+    else if(u1t == U1_E_TYPE)
+        printf("Union (o->u1.e) = %d\n", DataPtrFromHandle(oh)->u1.e);
+
+    printf("\n");
+
+    // Destroy the strong handle so that nothing will be keeping out object alive
+    HndDestroyHandle(HndGetHandleTable(oh), HNDTYPE_DEFAULT, oh);
+    pGCHeap->GarbageCollect();
+ 
+    printf("Post GC Without Handle p2:%p p3:%p\n", HndFetchHandle(ohWeak1), HndFetchHandle(ohWeak2));
+    if(u1t == U1_C_TYPE)
+        printf("Union p3= %p\n", HndFetchHandle(ohWeak3));
+
+    return 0;
+}
+
 int __cdecl main(int argc, char* argv[])
 {
     //
@@ -149,10 +307,12 @@ int __cdecl main(int argc, char* argv[])
     //
     ThreadStore::AttachCurrentThread();
 
+    return unionTypeExample(pGCHeap);
+
     //
     // Create a Methodtable with GCDesc
     //
-
+    /*
     class My : Object {
     public:
         Object * m_pOther1;
@@ -239,4 +399,6 @@ int __cdecl main(int argc, char* argv[])
     printf("Done\n");
 
     return 0;
+
+    */
 }
